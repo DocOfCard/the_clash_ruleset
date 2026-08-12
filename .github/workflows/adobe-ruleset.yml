@@ -1,0 +1,156 @@
+name: Generate Adobe Ruleset
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天 UTC 时间 02:00 运行
+  workflow_dispatch:  # 允许手动触发
+
+permissions:
+  contents: write  # 添加写入权限
+
+jobs:
+  generate-adobe-rules:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+        
+      - name: Download, Merge and Extract Rules
+        run: |
+          # 确保目录存在
+          mkdir -p other/adobe/block/domain
+          mkdir -p other/adobe/block/ip
+          
+          # --- 1. 下载在线 Hosts 文件 ---
+          echo "Downloading from macwk.cn..."
+          curl -fsSL https://macwk.cn/list.txt > temp1.txt
+          
+          echo "Downloading from macat.vip..."
+          curl -fsSL https://www.macat.vip/list.txt > temp2.txt
+          
+          # 合并两个在线临时文件
+          cat temp1.txt temp2.txt > temp_all.txt
+          
+          # --- 2. 处理域名 (Domain) ---
+          echo "Processing Domains..."
+          
+          # 2.1 从在线列表提取域名
+          awk 'NF>=2 && !/^#/ && $2 !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$/ {print $2}' temp_all.txt > temp_domains_raw.txt
+          
+          # 2.2 合并本地自定义域名列表 (adddomain.list)
+          if [ -f "other/adobe/block/adddomain.list" ]; then
+            echo "Found adddomain.list, merging local domains..."
+            cat "other/adobe/block/adddomain.list" >> temp_domains_raw.txt
+          else
+            echo "No local adddomain.list found, skipping merge."
+          fi
+          
+          # 2.3 清理、去重并输出最终文件
+          cat temp_domains_raw.txt | \
+          sed 's/\.$//' | \
+          grep -v '^[[:space:]]*$' | \
+          sort -u > other/adobe/block/domain/Adobe.list
+          
+          # --- 3. 处理 IP (IP-CIDR) ---
+          echo "Processing IPs..."
+          
+          # 3.1 从在线列表提取 IP 并添加 /32
+          awk 'NF>=2 && !/^#/ && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$/ {
+            split($2, a, ":");
+            print a[1] "/32";
+          }' temp_all.txt > temp_ips_raw.txt
+          
+          # 3.2 合并本地自定义 IP 列表 (addip.list)
+          if [ -f "other/adobe/block/addip.list" ]; then
+            echo "Found addip.list, merging local IPs..."
+            # 使用 awk 智能处理：如果是纯IP自动加/32，如果是CIDR则保持原样
+            awk '{
+              # 跳过空行和注释
+              if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^#/) next;
+              # 如果包含 / 则直接打印，否则添加 /32
+              if ($0 ~ /\//) print $0; else print $0 "/32";
+            }' "other/adobe/block/addip.list" >> temp_ips_raw.txt
+          else
+            echo "No local addip.list found, skipping merge."
+          fi
+          
+          # 3.3 去重并输出最终文件
+          cat temp_ips_raw.txt | grep -v '^[[:space:]]*$' | sort -u > other/adobe/block/ip/Adobe.list
+          
+          # --- 4. 清理临时文件 ---
+          rm -f temp1.txt temp2.txt temp_all.txt temp_domains_raw.txt temp_ips_raw.txt
+          
+          echo "Total unique domains: $(wc -l < other/adobe/block/domain/Adobe.list)"
+          echo "Total unique IPs: $(wc -l < other/adobe/block/ip/Adobe.list)"
+          
+      - name: Download and unzip mihomo core
+        run: |
+          mihomo_version=$(curl -fsSL https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt)
+          echo "Downloading mihomo version: ${mihomo_version}"
+          wget "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/mihomo-linux-amd64-v3-${mihomo_version}.gz" -O - | gzip -d > ./mihomo
+          chmod +x ./mihomo
+          
+      - name: Generate mihomo mrs files
+        run: |
+          # 为域名生成 mrs 文件
+          if [ -s "other/adobe/block/domain/Adobe.list" ]; then
+            echo "Generating mrs file for domains..."
+            ./mihomo convert-ruleset domain text "other/adobe/block/domain/Adobe.list" "other/adobe/block/domain/Adobe.mrs"
+            echo "Domain mrs generated successfully"
+          else
+            echo "Warning: No domains found!"
+          fi
+          
+          # 为 IP 生成 mrs 文件
+          if [ -s "other/adobe/block/ip/Adobe.list" ]; then
+            echo "Generating mrs file for IPs..."
+            ./mihomo convert-ruleset ipcidr text "other/adobe/block/ip/Adobe.list" "other/adobe/block/ip/Adobe.mrs"
+            echo "IP mrs generated successfully"
+          else
+            echo "Warning: No IPs found!"
+          fi
+          
+      - name: Generate mihomo YAML rule files
+        run: |
+          # 生成域名 YAML 文件
+          if [ -s "other/adobe/block/domain/Adobe.list" ]; then
+            cat > other/adobe/block/domain/Adobe.yaml << 'DOMAINEOF'
+          payload:
+          DOMAINEOF
+            while IFS= read -r line; do
+              [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+              echo "  - '$line'" >> other/adobe/block/domain/Adobe.yaml
+            done < other/adobe/block/domain/Adobe.list
+            echo "Domain YAML generated"
+          fi
+          
+          # 生成 IP YAML 文件
+          if [ -s "other/adobe/block/ip/Adobe.list" ]; then
+            cat > other/adobe/block/ip/Adobe.yaml << 'IPEOF'
+          payload:
+          IPEOF
+            while IFS= read -r line; do
+              [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+              echo "  - '$line'" >> other/adobe/block/ip/Adobe.yaml
+            done < other/adobe/block/ip/Adobe.list
+            echo "IP YAML generated"
+          fi
+          
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # 添加所有更改
+          git add other/adobe/block/
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update Adobe ruleset (Integrated local lists) - $(date +'%Y-%m-%d %H:%M:%S')"
+            git push
+          fi
